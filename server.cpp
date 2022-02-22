@@ -2,7 +2,6 @@
 
 
 int qid;
-int shmid;
 SharedSem* sem;
 pthread_t mthread;
 std::vector<pthread_t> active;
@@ -12,7 +11,7 @@ int main(int argc, char* argv[])
 {
 	mthread = pthread_self();
 	qid = msgget(QUEUE_KEY, IPC_CREAT);
-	shmid = shmget(SHM_KEY, sizeof(SharedSem), IPC_CREAT | 0777);
+	int shmid = shmget(SHM_KEY, sizeof(SharedSem), IPC_CREAT | 0777);
 	sem = (SharedSem *) shmat(shmid, NULL, 0);
 	sem_init(&sem->clsem, 1, 1);
 	sem_init(&sem->svsem, 1, 1);
