@@ -9,31 +9,44 @@ std::vector<pthread_t> active;
 
 int main(int argc, char* argv[])
 {
-	mthread = pthread_self();
-	qid = msgget(QUEUE_KEY, IPC_CREAT);
-	int shmid = shmget(SHM_KEY, sizeof(SharedSem), IPC_CREAT | 0777);
-	sem = (SharedSem *) shmat(shmid, NULL, 0);
-	sem_init(&sem->clsem, 1, 1);
-	sem_init(&sem->svsem, 1, 1);
+	try {
+		mthread = pthread_self();
 
-	int game_pid = fork();
-	if (game_pid == 0)
-	{
-		try { gameServer(); }
-		catch (const std::string& _err) { std::cout << _err; exit(1); }
+		qid = msgget(QUEUE_KEY, IPC_CREAT);
+		if (qid < 0)
+			throw std::string("msgget() error") + std::to_string(errno);
+
+		int shmid = shmget(SHM_KEY, sizeof(SharedSem), IPC_CREAT | 0777);
+		if (shmid < 0)
+			throw std::string("shmget() error") + std::to_string(errno);
+
+		sem = (SharedSem *) shmat(shmid, NULL, 0);
+		if (!sem)
+			throw std::string("shmat() error") + std::to_string(errno);
+
+		if (sem_init(&sem->clsem, 1, 1) || sem_init(&sem->svsem, 1, 1))
+			throw std::string("sem_init() error") + std::to_string(errno);
+
+		int game_pid = fork();
+		if (game_pid < 0)
+			throw std::string("fork() error") + std::to_string(errno);
+		if (game_pid == 0)
+			gameServer();
+
+		int image_pid = fork();
+		if (image_pid < 0)
+			throw std::string("fork() error") + std::to_string(errno);
+		if (image_pid == 0)
+			imageServer();
+
+		netServer();
+		return 0;
 	}
-
-	int image_pid = fork();
-	if (image_pid == 0)
+	catch (const std::string& _err)
 	{
-		try { imageServer(); }
-		catch (const std::string& _err) { std::cout << _err; exit(2); }
+		std::cout << _err;
+		return 1;
 	}
-
-	try { netServer(); }
-	catch (const std::string& _err) { std::cout << _err; exit(-1); }
-
-	return 0;
 }
 
 
@@ -42,9 +55,10 @@ void netServer()
 	auto thr_iter = active.cbegin();
 	int master_socket, nsocket;
 	if ((master_socket = socket(AF_INET , SOCK_STREAM , 0)) == -1)
-		throw std::string("socket() error");
+		throw std::string("socket() error") + std::to_string(errno);
 
 	sockaddr_in address;
+	memset(&address, 0, sizeof(sockaddr_in));
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = INADDR_ANY;
 	address.sin_port = htons(8888);
@@ -58,19 +72,24 @@ void netServer()
 		throw std::string("bind() error") + std::to_string(errno);
 
 	if (listen(master_socket, MAX_CONNECTIONS))
-		throw std::string("listen() error");
+		throw std::string("listen() error") + std::to_string(errno);
 
 	while (true)
 	{
 	        nsocket = accept(master_socket, (sockaddr *) &address, &addrlen);
+			if (nsocket)
+				throw std::string("accept() error") + std::to_string(errno);
+
 			thr_iter = std::find(active.cbegin(), active.cend(), mthread);
 			if (thr_iter == active.cend())
 			{
 				active.push_back(mthread);
-				thr_iter = active.cend();
+				thr_iter = --active.cend();
 			}
-			pthread_create((pthread_t*) &(*thr_iter), NULL,
-				&clientInteractor, &nsocket);
+			if (pthread_create((pthread_t*) &(*thr_iter), NULL,
+					&clientInteractor, &nsocket))
+				throw std::string("pthread_create() error")
+						+ std::to_string(errno);;
 	}
 }
 
