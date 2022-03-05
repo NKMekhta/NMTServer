@@ -96,7 +96,7 @@ void netServer()
 
 void *clientInteractor(void *msock)
 {
-	int my_socket = *(int*) msock;
+	int my_socket = *(int*) msock, sockerr;
 	auto my_iter = std::find(active.begin(), active.end(), pthread_self());
 	uint64_t client_id = my_iter - active.cbegin();
 
@@ -113,7 +113,22 @@ void *clientInteractor(void *msock)
 
 	while (true)
 	{
-		recv(my_socket, &type, sizeof(type), 0);
+		while (true)
+		{
+			msgrcv(qid, &qmsg, sizeof(qmsg), client_id * 2 + 1,	IPC_NOWAIT);
+			if (errno == ENOMSG)
+				break;
+
+			send(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0);
+			send(my_socket, &qmsg.turn, sizeof(qmsg.turn), 0);
+		}
+
+		sockerr = recv(my_socket, &type, sizeof(type), MSG_DONTWAIT);
+		if (sockerr < 0)
+			continue;
+		if (!sockerr)
+			return NULL;
+
 		if (type)
 		{
 			recv(my_socket, &in_size, sizeof(in_size), 0);
@@ -162,38 +177,33 @@ void *clientInteractor(void *msock)
 
 			while (sem->proc);
 			img_outfile.open(img_name, std::ios::binary);
-			img_outfile.seekg(0, img_outfile.end);
-		    in_size = img_outfile.tellg();
-		    img_outfile.seekg(0, img_outfile.beg);
-		    data = new char[in_size];
-		    img_outfile.read(data, in_size);
-			img_outfile.close();
-			send(my_socket, &type, sizeof(type), 0);
-			send(my_socket, &in_size, sizeof(in_size), 0);
-			send(my_socket, data, in_size, 0);
-		    delete[] data;
-
+			if (img_outfile.is_open())
+			{
+				img_outfile.seekg(0, img_outfile.end);
+				in_size = img_outfile.tellg();
+				img_outfile.seekg(0, img_outfile.beg);
+				data = new char[in_size];
+				img_outfile.read(data, in_size);
+				img_outfile.close();
+				send(my_socket, &type, sizeof(type), 0);
+				send(my_socket, &in_size, sizeof(in_size), 0);
+				send(my_socket, data, in_size, 0);
+				delete[] data;
+			}
+			else
+			{
+				in_size = 0;
+				send(my_socket, &in_size, sizeof(in_size), 0);
+			}
 			sem_post(&sem->svsem);
 			datsiz.clear();
 		}
 
 		else
 		{
-			qmsg = { 1, client_id, true, type };
+			qmsg = { client_id * 2, true, type };
 			recv(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0);
 			msgsnd(qid, &qmsg, sizeof(qmsg), 0);
-		}
-
-		while (true)
-		{
-			msgrcv(qid, &qmsg, sizeof(qmsg), 2,	IPC_NOWAIT);
-			if (errno == ENOMSG)
-				break;
-
-			type = 0;
-			send(my_socket, &type, sizeof(type), 0);
-			send(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0);
-			send(my_socket, &qmsg.turn, sizeof(qmsg.turn), 0);
 		}
 	}
 
@@ -205,7 +215,16 @@ void *clientInteractor(void *msock)
 
 void imageServer()
 {
-
+	while (true)
+	{
+		sem_wait(&sem->svsem);
+		if (sem->proc)
+		{
+			system(sem->comm);
+			sem->proc = false;
+		}
+		sem_post(&sem->svsem);
+	}
 }
 
 
@@ -222,24 +241,24 @@ void gameServer()
 	{
 		msgrcv(qid, &cmsg, sizeof(GameMsg), 1, 0);
 
-		if (sessions.count(cmsg.clid))
+		if (sessions.count(cmsg.mtype / 2))
 		{
-			session = sessions[cmsg.clid];
+			session = sessions[cmsg.mtype / 2];
 
-			if ((cmsg.clid == session->clid[0]) != session->player)
+			if ((cmsg.mtype / 2 == session->clid[0]) != session->player)
 				continue;
 
 			try { won = !session->subtract(cmsg.amount); }
 			catch (const GameSession::Errors& exc)
 			{
-				cmsg = { 2, cmsg.clid, true, session->left };
+				cmsg = { cmsg.mtype * 2 + 1, true, session->left };
 				msgsnd(qid, &cmsg, sizeof(GameMsg), 0);
 				continue;
 			}
 
-			cmsg = { 2, session->clid[0], session->player, session->left };
+			cmsg = { session->clid[0] * 2 + 1, session->player, session->left };
 			msgsnd(qid, &cmsg, sizeof(GameMsg), 0);
-			cmsg = { 2, session->clid[1], !session->player, session->left };
+			cmsg = { session->clid[1] * 2 + 1, !session->player, session->left };
 			msgsnd(qid, &cmsg, sizeof(GameMsg), 0);
 			if (won)
 			{
@@ -251,22 +270,22 @@ void gameServer()
 
 		else if (waiting[0])
 		{
-			waiting[1] = cmsg.clid;
+			waiting[1] = cmsg.mtype / 2;
 			session = new GameSession;
 			session->clid[0] = waiting[0];
 			session->clid[1] = waiting[1];
 			sessions.insert(SessionID(waiting[0], session));
 			sessions.insert(SessionID(waiting[1], session));
-			cmsg = { 2, waiting[0], true, session->left };
+			cmsg = { waiting[0] * 2 + 1, true, session->left };
 			msgsnd(qid, &cmsg, sizeof(GameMsg), 0);
-			cmsg = { 2, waiting[1], false, session->left };
+			cmsg = { waiting[1] * 2 + 1, false, session->left };
 			msgsnd(qid, &cmsg, sizeof(GameMsg), 0);
 			waiting[0] = 0;
 			waiting[1] = 0;
 		}
 
 		else
-			waiting[0] = cmsg.clid;
+			waiting[0] = cmsg.mtype / 2;
 	}
 }
 

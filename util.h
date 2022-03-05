@@ -56,8 +56,7 @@ struct GameSession
 
 struct GameMsg
 {
-	long int mtype;
-	uint64_t clid;
+	uint64_t mtype;
 	bool turn;
 	uint8_t amount;
 };
