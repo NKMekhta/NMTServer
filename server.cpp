@@ -7,7 +7,7 @@ pthread_t mthread;
 std::vector<pthread_t> active;
 
 
-int main(int argc, char* argv[])
+int main()
 {
 	try {
 		mthread = pthread_self();
@@ -54,7 +54,7 @@ void netServer()
 {
 	auto thr_iter = active.cbegin();
 	int master_socket, nsocket;
-	if ((master_socket = socket(AF_INET , SOCK_STREAM , 0)) == -1)
+	if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1)
 		throw std::string("socket() error") + std::to_string(errno);
 
 	sockaddr_in address;
@@ -185,7 +185,6 @@ void *clientInteractor(void *msock)
 				data = new char[in_size];
 				img_outfile.read(data, in_size);
 				img_outfile.close();
-				send(my_socket, &type, sizeof(type), 0);
 				send(my_socket, &in_size, sizeof(in_size), 0);
 				send(my_socket, data, in_size, 0);
 				delete[] data;
