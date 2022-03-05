@@ -44,7 +44,7 @@ int main()
 	}
 	catch (const std::string& _err)
 	{
-		std::cout << _err;
+		perror(_err.c_str());;
 		return 1;
 	}
 }
