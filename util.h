@@ -13,6 +13,7 @@
 #include <iostream>
 #include <algorithm>
 
+#include <netdb.h>
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
@@ -35,7 +36,8 @@
 
 
 void netServer();
-void *clientInteractor(void *);
+void *threadWrapper(void *);
+void clientInteractor(int, uint64_t);
 void imageServer();
 void gameServer();
 
@@ -43,10 +45,10 @@ void gameServer();
 struct GameSession
 {
 	uint64_t clid[2];
-	bool player = true;
-	uint8_t left = 21;
+	bool player{true};
+	uint8_t left{21};
 
-	bool subtract(const uint8_t _amount);
+	void subtract(const uint8_t _amount);
 
 	enum Errors {
 		NOT_ENOUGH_STICKS = 1,

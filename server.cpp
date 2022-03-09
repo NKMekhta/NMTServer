@@ -1,7 +1,7 @@
 #include "util.h"
 
 
-int qid[2];
+int qid[2]{};
 SharedSem* sem;
 pthread_t mthread;
 std::vector<pthread_t> active;
@@ -29,14 +29,18 @@ int main()
 	pid_t child[3];
 	mthread = pthread_self();
 
-	qid[0] = msgget(ftok("inqueue", QUEUE_KEY), IPC_CREAT | 0777);
+	uint8_t buff;
+	qid[0] = msgget(QUEUE_KEY, IPC_CREAT | 0777);
 	if (qid[0] < 0)
 	{ logg->print(Log::ERROR, "ProcessManager", "msgget()", errno); return 1; }
+	while (errno != ENOMSG)
+		msgrcv(qid[0], &buff, 1, 0, IPC_NOWAIT);
 
-	qid[1] = msgget(ftok("outqueue", QUEUE_KEY), IPC_CREAT | 0777);
+	qid[1] = msgget(QUEUE_KEY + 1, IPC_CREAT | 0777);
 	if (qid[1] < 0)
 	{ logg->print(Log::ERROR, "ProcessManager", "msgget()", errno); return 1; }
-
+	while (errno != ENOMSG)
+		msgrcv(qid[1], &buff, 1, 0, IPC_NOWAIT);
 
 	if (sem_init(&sem->clsem, 1, 1) || sem_init(&sem->svsem, 1, 1))
 	{ logg->print(Log::ERROR, "ProcessManager", "sem_init()", errno); return 1; }
@@ -85,6 +89,7 @@ int main()
 void netServer()
 {
 	std::stringstream logmsg;
+	char addrbuff[INET_ADDRSTRLEN];
 	auto thr_iter = active.cbegin();
 	int master_socket, nsocket;
 	if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1)
@@ -103,7 +108,7 @@ void netServer()
 	if (getsockname(master_socket, (sockaddr *) &address, &addrlen))
 	{ logg->print(Log::ERROR, "NetServer", "getsockname()", errno); exit(1); }
 
-	logmsg << "Bound to port " << ntohs(address.sin_port) << '.';
+	logmsg << "Bound to port " << ntohs(address.sin_port);
 	logg->print(Log::INFO, "NetServer", logmsg);
 
 	if (listen(master_socket, MAX_CONNECTIONS))
@@ -116,26 +121,40 @@ void netServer()
 		if (nsocket < 0)
 		{ logg->print(Log::ERROR, "NetServer", "listen()", errno); exit(1); }
 
-		logg->print(Log::INFO, "NetServer", "Accepted connection.");
+		getnameinfo((sockaddr*) &address, addrlen, addrbuff, sizeof(addrbuff), 0, 0, NI_NUMERICHOST);
+		logmsg << "Accepted connection from: " << addrbuff << ':' << ntohs(address.sin_port);
+		logg->print(Log::INFO, "NetServer", logmsg);
 		thr_iter = std::find(active.cbegin(), active.cend(), mthread);
 		if (thr_iter == active.cend())
 		{
 			active.push_back(mthread);
 			thr_iter = --active.cend();
 		}
-		if (pthread_create((pthread_t*) &(*thr_iter), NULL, &clientInteractor, &nsocket))
+		if (pthread_create((pthread_t*) &(*thr_iter), NULL, &threadWrapper, &nsocket))
 		{ logg->print(Log::ERROR, "NetServer", "pthread_create()", errno); exit(1); }
 	}
 }
 
 
-void *clientInteractor(void *msock)
+void *threadWrapper(void *msock)
 {
-	int err, my_socket = *(int *) msock;
+	int my_socket = *(int *) msock;
 	auto my_iter = std::find(active.begin(), active.end(), pthread_self());
 	uint64_t client_id = 1 + (my_iter - active.cbegin());
 	logg->print(Log::INFO, client_id, "Thread active.");
 
+	clientInteractor(my_socket, client_id);
+
+	close(my_socket);
+	*my_iter = mthread;
+	logg->print(Log::INFO, client_id, "Thread exited.");
+	return NULL;
+}
+
+
+void clientInteractor(int my_socket, uint64_t client_id)
+{
+	int err;
 	uint8_t type;
 	GameMsg qmsg;
 	uint64_t in_size = 0;
@@ -146,35 +165,44 @@ void *clientInteractor(void *msock)
 	std::string img_name;
 	std::ofstream img_file;
 	std::ifstream img_outfile;
+	std::stringstream logmsg;
 
 	while (true)
 	{
-		while (true)
+		sleep(1);
+		err = msgrcv(qid[1], &qmsg, sizeof(qmsg), client_id, IPC_NOWAIT);
+		if (err >= 0)
 		{
-			err = msgrcv(qid[1], &qmsg, sizeof(qmsg), client_id, IPC_NOWAIT);
-			if (errno == ENOMSG || !err)
-				break;
-			if (err < 0)
-			{ logg->print(Log::ERROR, client_id, "msgrcv()", errno); pthread_exit(NULL); }
+			logmsg << sizeof(qmsg.mtype) << ':' << (uint64_t)qmsg.mtype << ' ';
+			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
+			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
+			logg->commDebug("GameServer", client_id, logmsg);
 
 			logg->print(Log::INFO, client_id, "Forwarding messages from game server.");
-			if (send(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0) < 0 ||
-					send(my_socket, &qmsg.turn, sizeof(qmsg.turn), 0) < 0)
-			{ logg->print(Log::ERROR, client_id, "send()", errno); pthread_exit(NULL); }
-			logg->print(Log::INFO, client_id, "Forwarding finished.");
+			if (send(my_socket, &qmsg.turn, sizeof(qmsg.amount) + sizeof(qmsg.turn), 0) < 0)
+				return logg->print(Log::ERROR, client_id, "send()", errno);
+
+			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
+			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
+			logg->commDebug(client_id, "Client", logmsg);
 		}
+		else if (errno != ENOMSG)
+			return logg->print(Log::ERROR, client_id, "msgrcv()", errno);
 
 		err = recv(my_socket, &type, sizeof(type), MSG_DONTWAIT);
+		if (!err)
+			return logg->print(Log::INFO, client_id, "Client left.");
 		if (err < 0)
 		{
 			if (errno == EAGAIN)
 				continue;
 			else
-			{ logg->print(Log::ERROR, client_id, "recv().", errno); pthread_exit(NULL); }
+				return logg->print(Log::ERROR, client_id, "recv().", errno);
 		}
-		if (!err)
-		{ logg->print(Log::INFO, client_id, "Client left."); pthread_exit(NULL); }
 		logg->print(Log::INFO, client_id, "Recieved client message.");
+
+		logmsg << sizeof(type) << ':' << (uint64_t)type << ' ';
+		logg->commDebug("Client", client_id, logmsg);
 
 		if (type)
 		{
@@ -245,7 +273,7 @@ void *clientInteractor(void *msock)
 			}
 			else
 			{
-				logg->print(Log::ERROR, client_id, "Image server processing error.");
+				logg->print(Log::WARNING, client_id, "Image server processing error.");
 				in_size = 0;
 				send(my_socket, &in_size, sizeof(in_size), 0);
 			}
@@ -259,12 +287,18 @@ void *clientInteractor(void *msock)
 			logg->print(Log::INFO, client_id, "Forwarding message to game server.");
 			qmsg = { client_id, true, 0 };
 			recv(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0);
+
+			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
+			logg->commDebug("Client", client_id, logmsg);
+
 			msgsnd(qid[0], &qmsg, sizeof(qmsg), 0);
+
+			logmsg << sizeof(qmsg.mtype) << ':' << (uint64_t)qmsg.mtype << ' ';
+			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
+			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
+			logg->commDebug(client_id, "GameServer", logmsg);
 		}
 	}
-
-	close(my_socket);
-	*my_iter = mthread;
 }
 
 
@@ -289,9 +323,8 @@ void imageServer()
 
 void gameServer()
 {
-	logg->print(Log::INFO, "GameServer", "GameServer running.");
+	logg->print(Log::INFO, "GameServer", "Running.");
 	std::stringstream logmsg;
-	bool won;
 	GameSession* session;
 	GameMsg cmsg;
     uint64_t waiting[2] = { 0, 0 };
@@ -300,16 +333,18 @@ void gameServer()
 
 	while (true)
 	{
-		msgrcv(qid[0], &cmsg, sizeof(GameMsg), 0, 0);
+		if (msgrcv(qid[0], &cmsg, sizeof(cmsg), 0, 0) < 0)
+		{
+			logg->print(Log::ERROR, "GameServer", "msgrcv()", errno);
+			exit(1);
+		}
+
 		logmsg << "Received message from " << cmsg.mtype << '.';
 		logg->print(Log::INFO, "GameServer", logmsg);
 
 		if (sessions.count(cmsg.mtype))
 		{
-			logmsg << cmsg.mtype << " in game.";
-			logg->print(Log::INFO, "GameServer", logmsg);
 			session = sessions[cmsg.mtype];
-
 			if ((cmsg.mtype == session->clid[0]) != session->player)
 			{
 				logmsg << "Unexpected message from " << cmsg.mtype << '.';
@@ -319,8 +354,9 @@ void gameServer()
 
 			try
 			{
-				won = !session->subtract(cmsg.amount);
+				session->subtract(cmsg.amount);
 				logmsg << cmsg.mtype << " had a turn.";
+				logg->print(Log::INFO, "GameServer", logmsg);
 			}
 			catch (const GameSession::Errors exc)
 			{
@@ -328,19 +364,36 @@ void gameServer()
 				logg->print(Log::INFO, "GameServer", logmsg);
 
 				cmsg = { cmsg.mtype, true, session->left };
-				msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
+				if (msgsnd(qid[1], &cmsg, sizeof(cmsg), 0))
+				{
+					logg->print(Log::ERROR, "GameServer", "msgsnd()", errno);
+					exit(1);
+				}
+				logmsg << "Resent turn to " << cmsg.mtype << '.';
+				logg->print(Log::INFO, "GameServer", logmsg);
 				continue;
 			}
 
-			logmsg << "Sending game data to " << session->clid[0];
-			logmsg << " and " << session->clid[1] << '.';
+			logmsg << "Sending game data to " << cmsg.mtype << '.';
 			logg->print(Log::INFO, "GameServer", logmsg);
-
 			cmsg = { session->clid[0], session->player, session->left };
-			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
+			if (msgsnd(qid[1], &cmsg, sizeof(cmsg), 0))
+			{
+				logg->print(Log::ERROR, "GameServer", "msgsnd()", errno);
+				exit(1);
+			}
+
+
+			logmsg << "Sending game data to " << cmsg.mtype << '.';
+			logg->print(Log::INFO, "GameServer", logmsg);
 			cmsg = { session->clid[1], !session->player, session->left };
-			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
-			if (won)
+			if (msgsnd(qid[1], &cmsg, sizeof(cmsg), 0))
+			{
+				logg->print(Log::ERROR, "GameServer", "msgsnd()", errno);
+				exit(1);
+			}
+
+			if (!session->left)
 			{
 				logmsg << "Finishing game for " << session->clid[0];
 				logmsg << " and " << session->clid[1] << '.';
@@ -354,19 +407,28 @@ void gameServer()
 
 		else if (waiting[0])
 		{
-			logmsg << "Starting session for " << waiting[0];
-			logmsg << " and " << waiting[1];
-			logg->print(Log::INFO, "GameServer", logmsg);
 			waiting[1] = cmsg.mtype;
+			logmsg << "Starting session for " << waiting[0];
+			logmsg << " and " << waiting[1] << '.';
+			logg->print(Log::INFO, "GameServer", logmsg);
 			session = new GameSession;
 			session->clid[0] = waiting[0];
 			session->clid[1] = waiting[1];
 			sessions.insert(SessionID(waiting[0], session));
 			sessions.insert(SessionID(waiting[1], session));
-			cmsg = { waiting[0], true, session->left };
-			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
-			cmsg = { waiting[1], false, session->left };
-			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
+
+			cmsg = { session->clid[0], session->player, session->left };
+			logmsg << "Signaling start for " << cmsg.mtype << '.';
+			logg->print(Log::INFO, "GameServer", logmsg);
+			if (msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0))
+			{ logg->print(Log::ERROR, "GameServer", "msgsnd()", errno); exit(1); }
+
+			cmsg = { session->clid[1], !session->player, session->left };
+			logmsg << "Signaling start for " << cmsg.mtype << '.';
+			logg->print(Log::INFO, "GameServer", logmsg);
+			if (msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0))
+			{ logg->print(Log::ERROR, "GameServer", "msgsnd()", errno); exit(1); }
+
 			waiting[0] = 0;
 			waiting[1] = 0;
 		}
@@ -377,12 +439,11 @@ void gameServer()
             logmsg << "Adding " << waiting[0] << " to waiting room.";
 			logg->print(Log::INFO, "GameServer", logmsg);
 		}
-
 	}
 }
 
 
-bool GameSession::subtract(const uint8_t _amount)
+void GameSession::subtract(const uint8_t _amount)
 {
 	if (left < _amount)
 		throw Errors::NOT_ENOUGH_STICKS;
@@ -395,5 +456,4 @@ bool GameSession::subtract(const uint8_t _amount)
 
 	left -= _amount;
 	player = !player;
-	return !left;
 }
