@@ -29,38 +29,38 @@ int main()
 	pid_t child[3];
 	mthread = pthread_self();
 
-	qid[0] = msgget(QUEUE_KEY, IPC_CREAT);
+	qid[0] = msgget(ftok("inqueue", QUEUE_KEY), IPC_CREAT | 0777);
 	if (qid[0] < 0)
-	{ logg->print(Log::ERROR, "", "msgget()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "msgget()", errno); return 1; }
 
-	qid[1] = msgget(QUEUE_KEY, IPC_CREAT);
+	qid[1] = msgget(ftok("outqueue", QUEUE_KEY), IPC_CREAT | 0777);
 	if (qid[1] < 0)
-	{ logg->print(Log::ERROR, "", "msgget()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "msgget()", errno); return 1; }
 
 
 	if (sem_init(&sem->clsem, 1, 1) || sem_init(&sem->svsem, 1, 1))
-	{ logg->print(Log::ERROR, "", "sem_init()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "sem_init()", errno); return 1; }
 
 	child[0] = fork();
 	if (child[0] < 0)
-	{ logg->print(Log::ERROR, "", "fork()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "fork()", errno); return 1; }
 	if (child[0] == 0)
 		netServer();
-	logg->print(Log::INFO, "", "Forked NetServer.");
+	logg->print(Log::INFO, "ProcessManager", "Forked NetServer.");
 
 	child[1] = fork();
 	if (child[1] < 0)
-	{ logg->print(Log::ERROR, "", "fork()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "fork()", errno); return 1; }
 	if (child[1] == 0)
 		gameServer();
-	logg->print(Log::INFO, "", "Forked GameServer.");
+	logg->print(Log::INFO, "ProcessManager", "Forked GameServer.");
 
 	child[2] = fork();
 	if (child[2] < 0)
-	{ logg->print(Log::ERROR, "", "fork()", errno); return 1; }
+	{ logg->print(Log::ERROR, "ProcessManager", "fork()", errno); return 1; }
 	if (child[2] == 0)
 		imageServer();
-	logg->print(Log::INFO, "", "Forked ImageServer.");
+	logg->print(Log::INFO, "ProcessManager", "Forked ImageServer.");
 
 
 	pid_t result;
@@ -71,11 +71,12 @@ int main()
 			continue;
 		else
 		{
-			logg->print(Log::FATAL, "", "Child process died, exiting...");
+			logg->print(Log::FATAL, "ProcessManager", "Child process died, exiting...");
 			for (pid_t j : child)
 				kill(j, SIGTERM);
 			return 1;
 		}
+		sleep(5);
 	}
 	return 0;
 }
@@ -83,6 +84,7 @@ int main()
 
 void netServer()
 {
+	std::stringstream logmsg;
 	auto thr_iter = active.cbegin();
 	int master_socket, nsocket;
 	if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1)
@@ -92,11 +94,17 @@ void netServer()
 	memset(&address, 0, sizeof(sockaddr_in));
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons(8888);
+	address.sin_port = 0;
 	uint32_t addrlen = sizeof(address);
 
-	if (bind(master_socket, (sockaddr *) &address, sizeof(address)))
+	if (bind(master_socket, (sockaddr *) &address, addrlen))
 	{ logg->print(Log::ERROR, "NetServer", "bind()", errno); exit(1); }
+
+	if (getsockname(master_socket, (sockaddr *) &address, &addrlen))
+	{ logg->print(Log::ERROR, "NetServer", "getsockname()", errno); exit(1); }
+
+	logmsg << "Bound to port " << ntohs(address.sin_port) << '.';
+	logg->print(Log::INFO, "NetServer", logmsg);
 
 	if (listen(master_socket, MAX_CONNECTIONS))
 	{ logg->print(Log::ERROR, "NetServer", "listen()", errno); exit(1); }
@@ -150,7 +158,6 @@ void *clientInteractor(void *msock)
 			{ logg->print(Log::ERROR, client_id, "msgrcv()", errno); pthread_exit(NULL); }
 
 			logg->print(Log::INFO, client_id, "Forwarding messages from game server.");
-			logg->print(Log::INFO, client_id, "Thread active.");
 			if (send(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0) < 0 ||
 					send(my_socket, &qmsg.turn, sizeof(qmsg.turn), 0) < 0)
 			{ logg->print(Log::ERROR, client_id, "send()", errno); pthread_exit(NULL); }
@@ -159,7 +166,12 @@ void *clientInteractor(void *msock)
 
 		err = recv(my_socket, &type, sizeof(type), MSG_DONTWAIT);
 		if (err < 0)
-			continue;
+		{
+			if (errno == EAGAIN)
+				continue;
+			else
+			{ logg->print(Log::ERROR, client_id, "recv().", errno); pthread_exit(NULL); }
+		}
 		if (!err)
 		{ logg->print(Log::INFO, client_id, "Client left."); pthread_exit(NULL); }
 		logg->print(Log::INFO, client_id, "Recieved client message.");
@@ -175,9 +187,9 @@ void *clientInteractor(void *msock)
 				recv(my_socket, &datsiz.back().second, 8, 0);
 			}
 
-			std::cout << "[INFO](CLINT=" << client_id << ") Waiting for image server entry." << std::endl;
+			logg->print(Log::INFO, client_id, "Waiting for image server entry.");
 			sem_wait(&sem->clsem);
-			std::cout << "[INFO](CLINT=" << client_id << ") Entered image server." << std::endl;
+			logg->print(Log::INFO, client_id, "Entered image server.");
 
 			for (datsiz_iter = datsiz.cbegin();
 				datsiz_iter != datsiz.cend() - 1;
@@ -198,7 +210,7 @@ void *clientInteractor(void *msock)
 				delete[] data;
 			}
 
-			std::cout << "[INFO](CLINT=" << client_id << ") Passing processing to image server." << std::endl;
+			logg->print(Log::INFO, client_id, "Passing processing to image server.");
 			in_size = datsiz.back().first;
 			data = new char[in_size];
 			recv(my_socket, data, in_size, 0);
@@ -214,9 +226,9 @@ void *clientInteractor(void *msock)
 			img_name = data;
 			delete[] data;
 
-			std::cout << "[INFO](CLINT=" << client_id << ") Waiting for image server result." << std::endl;
+			logg->print(Log::INFO, client_id, "Waiting for image server result.");
 			while (sem->proc);
-			std::cout << "[INFO](CLINT=" << client_id << ") Sending image result." << std::endl;
+			logg->print(Log::INFO, client_id, "Sending image result.");
 			img_outfile.open(img_name, std::ios::binary);
 			if (img_outfile.is_open())
 			{
@@ -229,17 +241,17 @@ void *clientInteractor(void *msock)
 				send(my_socket, &in_size, sizeof(in_size), 0);
 				send(my_socket, data, in_size, 0);
 				delete[] data;
-				std::cout << "[INFO](CLINT=" << client_id << ") Image processing finished." << std::endl;
+				logg->print(Log::INFO, client_id, "Image processing finished.");
 			}
 			else
 			{
-				std::cout << "[ERROR](CLINT=" << client_id << ") Sending image server processing error." << std::endl;
+				logg->print(Log::ERROR, client_id, "Image server processing error.");
 				in_size = 0;
 				send(my_socket, &in_size, sizeof(in_size), 0);
 			}
 			sem_post(&sem->svsem);
 			datsiz.clear();
-			std::cout << "[INFO](CLINT=" << client_id << ") Left image server." << std::endl;
+			logg->print(Log::INFO, client_id, "Left image server.");
 		}
 
 		else
@@ -270,6 +282,7 @@ void imageServer()
 			logg->print(Log::INFO, "ImageServer", "Processing finished.");
 		}
 		sem_post(&sem->svsem);
+		sleep(1);
 	}
 }
 
@@ -277,6 +290,7 @@ void imageServer()
 void gameServer()
 {
 	logg->print(Log::INFO, "GameServer", "GameServer running.");
+	std::stringstream logmsg;
 	bool won;
 	GameSession* session;
 	GameMsg cmsg;
@@ -287,22 +301,40 @@ void gameServer()
 	while (true)
 	{
 		msgrcv(qid[0], &cmsg, sizeof(GameMsg), 0, 0);
-		logg->print(Log::INFO, "GameServer", "Received message.");
+		logmsg << "Received message from " << cmsg.mtype << '.';
+		logg->print(Log::INFO, "GameServer", logmsg);
 
 		if (sessions.count(cmsg.mtype))
 		{
+			logmsg << cmsg.mtype << " in game.";
+			logg->print(Log::INFO, "GameServer", logmsg);
 			session = sessions[cmsg.mtype];
 
 			if ((cmsg.mtype == session->clid[0]) != session->player)
-				continue;
-
-			try { won = !session->subtract(cmsg.amount); }
-			catch (const GameSession::Errors& exc)
 			{
+				logmsg << "Unexpected message from " << cmsg.mtype << '.';
+				logg->print(Log::WARNING, "GameServer", logmsg);
+				continue;
+			}
+
+			try
+			{
+				won = !session->subtract(cmsg.amount);
+				logmsg << cmsg.mtype << " had a turn.";
+			}
+			catch (const GameSession::Errors exc)
+			{
+				logmsg << cmsg.mtype << " illegal turn rejected.";
+				logg->print(Log::INFO, "GameServer", logmsg);
+
 				cmsg = { cmsg.mtype, true, session->left };
 				msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
 				continue;
 			}
+
+			logmsg << "Sending game data to " << session->clid[0];
+			logmsg << " and " << session->clid[1] << '.';
+			logg->print(Log::INFO, "GameServer", logmsg);
 
 			cmsg = { session->clid[0], session->player, session->left };
 			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
@@ -310,6 +342,10 @@ void gameServer()
 			msgsnd(qid[1], &cmsg, sizeof(GameMsg), 0);
 			if (won)
 			{
+				logmsg << "Finishing game for " << session->clid[0];
+				logmsg << " and " << session->clid[1] << '.';
+				logg->print(Log::INFO, "GameServer", logmsg);
+
 				sessions.erase(sessions.find(session->clid[0]));
 				sessions.erase(sessions.find(session->clid[1]));
 				delete session;
@@ -318,6 +354,9 @@ void gameServer()
 
 		else if (waiting[0])
 		{
+			logmsg << "Starting session for " << waiting[0];
+			logmsg << " and " << waiting[1];
+			logg->print(Log::INFO, "GameServer", logmsg);
 			waiting[1] = cmsg.mtype;
 			session = new GameSession;
 			session->clid[0] = waiting[0];
@@ -333,7 +372,12 @@ void gameServer()
 		}
 
 		else
+		{
+			logmsg << "Adding " << session->clid[1] << " to waiting room.";
+			logg->print(Log::INFO, "GameServer", logmsg);
 			waiting[0] = cmsg.mtype;
+		}
+
 	}
 }
 

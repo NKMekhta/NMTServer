@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sstream>
 #include <iostream>
 
 #include <sys/sem.h>
@@ -18,4 +19,5 @@ public:
 	enum Type { INFO, WARNING, ERROR, FATAL } type;
 	void print(Type, int, const char*, int = 0);
 	void print(Type, const char*, const char*, int = 0);
+	void print(Type, const char*, std::stringstream&, int = 0);
 };
