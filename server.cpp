@@ -51,7 +51,7 @@ int main()
 	child[1] = fork();
 	if (child[1] < 0)
 	{ logg->print(Log::ERROR, "ProcessManager", "fork()", errno); return 1; }
-	if (child[1] == 0)
+	if (child[1] != 0)
 		gameServer();
 	logg->print(Log::INFO, "ProcessManager", "Forked GameServer.");
 
@@ -294,7 +294,7 @@ void gameServer()
 	bool won;
 	GameSession* session;
 	GameMsg cmsg;
-	uint64_t waiting[2];
+    uint64_t waiting[2] = { 0, 0 };
 	using SessionID = std::pair<uint64_t, GameSession*>;
 	std::map<uint64_t, GameSession*> sessions;
 
@@ -373,9 +373,9 @@ void gameServer()
 
 		else
 		{
-			logmsg << "Adding " << session->clid[1] << " to waiting room.";
+            waiting[0] = cmsg.mtype;
+            logmsg << "Adding " << waiting[0] << " to waiting room.";
 			logg->print(Log::INFO, "GameServer", logmsg);
-			waiting[0] = cmsg.mtype;
 		}
 
 	}

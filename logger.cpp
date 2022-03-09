@@ -92,17 +92,23 @@ void Log::print(Type _t, const char* _who, std::stringstream& _what, int _errn)
 		out = "[FATAL]";
 		break;
 	}
+
 	out += "(";
 	out += _who;
 	out += ") ";
+
 	out += _what.str();
-	_what.clear();
+
 	if (_errn)
 	{
 		out += ": ";
 		out += strerror(_errn);
 	}
+	
 	sem_wait(&sem);
 	str << out << std::endl;
 	sem_post(&sem);
+
+	_what.clear();
+	_what.str({});
 }
