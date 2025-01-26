@@ -3,13 +3,22 @@
 
 int qid[2]{};
 SharedSem* sem;
-pthread_t mthread;
-std::vector<pthread_t> active;
 Log* logg;
+sem_t thr_sync;
+
+void netServer();
+void *threadWrapper(void *);
+void clientInteractor(int, uint64_t);
+void imageServer();
+void gameServer();
+void sendWrapper(const uint64_t, const int, const void *, const uint64_t);
+bool recvWrapper(const uint64_t, const int, void *, const uint64_t, bool = true);
+
 
 int main()
 {
-	try {
+	try
+	{
 		int shmid = shmget(SHM_KEY, sizeof(SharedSem), IPC_CREAT | 0777);
 		if (shmid < 0)
 			throw "[ERROR] shmget()";
@@ -17,7 +26,7 @@ int main()
 		sem = (SharedSem *) shmat(shmid, NULL, 0);
 		if (!sem)
 			throw "[ERROR] shmat()";
-		new (sem) SharedSem{ {}, {}, false, "", Log(std::cout) };
+		new (sem) SharedSem{ {}, {}, false, 0, "", Log(std::cout) };
 		logg = &sem->log;
 	}
 	catch (const char *_err)
@@ -27,8 +36,6 @@ int main()
 	}
 
 	pid_t child[3];
-	mthread = pthread_self();
-
 	uint8_t buff;
 	qid[0] = msgget(QUEUE_KEY, IPC_CREAT | 0777);
 	if (qid[0] < 0)
@@ -55,7 +62,7 @@ int main()
 	child[1] = fork();
 	if (child[1] < 0)
 	{ logg->print(Log::ERROR, "ProcessManager", "fork()", errno); return 1; }
-	if (child[1] != 0)
+	if (child[1] == 0)
 		gameServer();
 	logg->print(Log::INFO, "ProcessManager", "Forked GameServer.");
 
@@ -66,21 +73,15 @@ int main()
 		imageServer();
 	logg->print(Log::INFO, "ProcessManager", "Forked ImageServer.");
 
-
-	pid_t result;
 	while (true) for (pid_t i : child)
 	{
-		result = waitpid(i, NULL, WNOHANG);
-		if (result < 1)
-			continue;
-		else
+		sleep(1);
+		if (waitpid(i, NULL, WNOHANG) >= 1)
 		{
 			logg->print(Log::FATAL, "ProcessManager", "Child process died, exiting...");
-			for (pid_t j : child)
-				kill(j, SIGTERM);
+			kill(0, SIGTERM);
 			return 1;
 		}
-		sleep(5);
 	}
 	return 0;
 }
@@ -90,63 +91,92 @@ void netServer()
 {
 	std::stringstream logmsg;
 	char addrbuff[INET_ADDRSTRLEN];
-	auto thr_iter = active.cbegin();
 	int master_socket, nsocket;
+	sem_init(&thr_sync, 1, 1);
+	pthread_t thr;
+	std::vector<int> active;
+	std::vector<int>::reverse_iterator iter;
+
+
 	if ((master_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1)
-	{ logg->print(Log::ERROR, "NetServer", "socket()", errno); exit(1); }
+	{
+		logg->print(Log::ERROR, "NetServer", "socket()", errno);
+		exit(1);
+	}
 
 	sockaddr_in address;
 	memset(&address, 0, sizeof(sockaddr_in));
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = INADDR_ANY;
 	address.sin_port = 0;
-	uint32_t addrlen = sizeof(address);
+	socklen_t addrlen = sizeof(address);
 
 	if (bind(master_socket, (sockaddr *) &address, addrlen))
-	{ logg->print(Log::ERROR, "NetServer", "bind()", errno); exit(1); }
+	{
+		logg->print(Log::ERROR, "NetServer", "bind()", errno);
+		exit(1);
+	}
 
 	if (getsockname(master_socket, (sockaddr *) &address, &addrlen))
-	{ logg->print(Log::ERROR, "NetServer", "getsockname()", errno); exit(1); }
+	{
+		logg->print(Log::ERROR, "NetServer", "getsockname()", errno);
+		exit(1);
+	}
 
 	logmsg << "Bound to port " << ntohs(address.sin_port);
 	logg->print(Log::INFO, "NetServer", logmsg);
 
 	if (listen(master_socket, MAX_CONNECTIONS))
-	{ logg->print(Log::ERROR, "NetServer", "listen()", errno); exit(1); }
+	{
+		logg->print(Log::ERROR, "NetServer", "listen()", errno);
+		exit(1);
+	}
 
 	while (true)
 	{
 		logg->print(Log::INFO, "NetServer", "Waiting for connections...");
         nsocket = accept(master_socket, (sockaddr *) &address, &addrlen);
 		if (nsocket < 0)
-		{ logg->print(Log::ERROR, "NetServer", "listen()", errno); exit(1); }
+		{
+			logg->print(Log::ERROR, "NetServer", "listen()", errno);
+			exit(1);
+		}
 
 		getnameinfo((sockaddr*) &address, addrlen, addrbuff, sizeof(addrbuff), 0, 0, NI_NUMERICHOST);
 		logmsg << "Accepted connection from: " << addrbuff << ':' << ntohs(address.sin_port);
 		logg->print(Log::INFO, "NetServer", logmsg);
-		thr_iter = std::find(active.cbegin(), active.cend(), mthread);
-		if (thr_iter == active.cend())
+
+		sem_wait(&thr_sync);
+		for (iter = active.rbegin(); iter != active.rend() && !(*iter); ++iter);
+		active.erase(iter.base(), active.end());
+		active.push_back(nsocket);
+		sem_post(&thr_sync);
+
+		if (pthread_create(&thr, NULL, &threadWrapper, &active.back()))
 		{
-			active.push_back(mthread);
-			thr_iter = --active.cend();
+			logg->print(Log::ERROR, "NetServer", "pthread_create()", errno);
+			exit(1);
 		}
-		if (pthread_create((pthread_t*) &(*thr_iter), NULL, &threadWrapper, &nsocket))
-		{ logg->print(Log::ERROR, "NetServer", "pthread_create()", errno); exit(1); }
 	}
 }
 
 
-void *threadWrapper(void *msock)
+void *threadWrapper(void *sockptr)
 {
-	int my_socket = *(int *) msock;
-	auto my_iter = std::find(active.begin(), active.end(), pthread_self());
-	uint64_t client_id = 1 + (my_iter - active.cbegin());
+	sem_wait(&thr_sync);
+	int my_sock = *(int *) sockptr;
+	*(int *) sockptr = 0;
+	sem_post(&thr_sync);
+
+	uint64_t client_id = pthread_self();
 	logg->print(Log::INFO, client_id, "Thread active.");
 
-	clientInteractor(my_socket, client_id);
+	try { clientInteractor(my_sock, client_id); }
+	catch (...) { };
 
-	close(my_socket);
-	*my_iter = mthread;
+	if (close(my_sock) < 0)
+		logg->print(Log::ERROR, client_id, "Can't close socket.");
+
 	logg->print(Log::INFO, client_id, "Thread exited.");
 	return NULL;
 }
@@ -154,18 +184,22 @@ void *threadWrapper(void *msock)
 
 void clientInteractor(int my_socket, uint64_t client_id)
 {
-	int err;
-	uint8_t type;
-	GameMsg qmsg;
-	uint64_t in_size = 0;
-	using DataSize = std::pair<uint64_t, uint64_t>;
-	std::vector<DataSize> datsiz;
-	auto datsiz_iter = datsiz.cbegin();
-	char *data;
-	std::string img_name;
-	std::ofstream img_file;
-	std::ifstream img_outfile;
+	namespace fs = std::filesystem;
+
+	int err{};
+	uint8_t type{};
+	GameMsg qmsg{};
 	std::stringstream logmsg;
+
+	fs::path file;
+	void *map_file{};
+	char *recv_string{};
+	int file_descriptor{};
+	std::string name, command;
+	uint64_t name_size{}, file_size{}, image_amount{};
+	const std::string rm = "rm -rf ";
+	const std::string mkdir = "mkdir -p ";
+	const std::string imgdir = std::string("./images/") + std::to_string(client_id) + '/';
 
 	while (true)
 	{
@@ -173,112 +207,124 @@ void clientInteractor(int my_socket, uint64_t client_id)
 		err = msgrcv(qid[1], &qmsg, sizeof(qmsg), client_id, IPC_NOWAIT);
 		if (err >= 0)
 		{
-			logmsg << sizeof(qmsg.mtype) << ':' << (uint64_t)qmsg.mtype << ' ';
-			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
-			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
-			logg->commDebug("GameServer", client_id, logmsg);
-
-			logg->print(Log::INFO, client_id, "Forwarding messages from game server.");
+			logg->print(Log::INFO, client_id, "Forwarding message from game server.");
 			if (send(my_socket, &qmsg.turn, sizeof(qmsg.amount) + sizeof(qmsg.turn), 0) < 0)
 				return logg->print(Log::ERROR, client_id, "send()", errno);
-
-			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
-			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
-			logg->commDebug(client_id, "Client", logmsg);
 		}
 		else if (errno != ENOMSG)
 			return logg->print(Log::ERROR, client_id, "msgrcv()", errno);
 
-		err = recv(my_socket, &type, sizeof(type), MSG_DONTWAIT);
-		if (!err)
-			return logg->print(Log::INFO, client_id, "Client left.");
-		if (err < 0)
-		{
-			if (errno == EAGAIN)
-				continue;
-			else
-				return logg->print(Log::ERROR, client_id, "recv().", errno);
-		}
+		if (!recvWrapper(client_id, my_socket, &type, sizeof(type), false))
+			continue;
 		logg->print(Log::INFO, client_id, "Recieved client message.");
-
-		logmsg << sizeof(type) << ':' << (uint64_t)type << ' ';
-		logg->commDebug("Client", client_id, logmsg);
 
 		if (type)
 		{
 			logg->print(Log::INFO, client_id, "Started image processing.");
-			recv(my_socket, &in_size, sizeof(in_size), 0);
-			for (; in_size; --in_size)
-			{
-				datsiz.push_back(DataSize(0, 0));
-				recv(my_socket, &datsiz.back().first, 8, 0);
-				recv(my_socket, &datsiz.back().second, 8, 0);
-			}
+			recvWrapper(client_id, my_socket, &image_amount, sizeof(image_amount));
 
-			logg->print(Log::INFO, client_id, "Waiting for image server entry.");
+			logg->print(Log::INFO, client_id, (mkdir + imgdir).c_str());
+			system((mkdir + imgdir).c_str());
+
+			for (; image_amount; --image_amount)
+			{
+				recvWrapper(client_id, my_socket, &name_size,
+							sizeof(name_size));
+				recvWrapper(client_id, my_socket, &file_size,
+							sizeof(file_size));
+				recv_string = new char[name_size];
+				recvWrapper(client_id, my_socket, recv_string, name_size);
+				name = imgdir + recv_string;
+				delete[] recv_string;
+
+				std::ofstream(name.c_str());
+				file_descriptor = open(name.c_str(), O_RDWR);
+				if (file_descriptor < 0)
+					return logg->print(Log::ERROR, client_id, "open()", errno);
+
+				if (ftruncate(file_descriptor, file_size) < 0)
+					return logg->print(Log::ERROR, client_id, "ftrunctuate()", errno);
+
+				map_file = mmap(NULL, file_size, PROT_WRITE, MAP_SHARED, file_descriptor, 0);
+				if (map_file == MAP_FAILED)
+					return logg->print(Log::ERROR, client_id, "mmap()", errno);
+
+				recvWrapper(client_id, my_socket, map_file, file_size);
+				munmap(map_file, file_size);
+				close(file_descriptor);
+			}
+			logg->print(Log::INFO, client_id, "All images received.");
+
+			recvWrapper(client_id, my_socket, &name_size,
+						sizeof(name_size));
+			recv_string = new char[name_size];
+			recvWrapper(client_id, my_socket, recv_string, name_size);
+			command = recv_string;
+			delete[] recv_string;
+
+			recvWrapper(client_id, my_socket, &name_size, sizeof(name_size));
+			recv_string = new char[name_size];
+			recvWrapper(client_id, my_socket, recv_string, name_size);
+			name = imgdir + recv_string;
+			delete[] recv_string;
+
+			logg->print(Log::INFO, client_id, "Waiting for image server entry...");
 			sem_wait(&sem->clsem);
+
 			logg->print(Log::INFO, client_id, "Entered image server.");
-
-			for (datsiz_iter = datsiz.cbegin();
-				datsiz_iter != datsiz.cend() - 1;
-				++datsiz_iter)
-			{
-				in_size = (*datsiz_iter).first;
-				data = new char[in_size];
-				recv(my_socket, data, in_size, 0);
-				img_name = data;
-				delete[] data;
-
-				in_size = (*datsiz_iter).second;
-				data = new char[in_size];
-				recv(my_socket, data, in_size, 0);
-				img_file.open(img_name, std::ios::binary);
-				img_file.write(data, in_size);
-				img_file.close();
-				delete[] data;
-			}
-
-			logg->print(Log::INFO, client_id, "Passing processing to image server.");
-			in_size = datsiz.back().first;
-			data = new char[in_size];
-			recv(my_socket, data, in_size, 0);
 			sem_wait(&sem->svsem);
-			memcpy(&sem->comm, data, in_size);
+			sem->clint = client_id;
+			memcpy(&sem->comm, command.c_str(), command.size() + 1);
 			sem->proc = true;
 			sem_post(&sem->svsem);
-			delete[] data;
 
-			in_size = datsiz.back().second;
-			data = new char[in_size];
-			recv(my_socket, data, in_size, 0);
-			img_name = data;
-			delete[] data;
-
-			logg->print(Log::INFO, client_id, "Waiting for image server result.");
-			while (sem->proc);
-			logg->print(Log::INFO, client_id, "Sending image result.");
-			img_outfile.open(img_name, std::ios::binary);
-			if (img_outfile.is_open())
+			logg->print(Log::INFO, client_id, "Waiting for image server result...");
+			while (true)
 			{
-				img_outfile.seekg(0, img_outfile.end);
-				in_size = img_outfile.tellg();
-				img_outfile.seekg(0, img_outfile.beg);
-				data = new char[in_size];
-				img_outfile.read(data, in_size);
-				img_outfile.close();
-				send(my_socket, &in_size, sizeof(in_size), 0);
-				send(my_socket, data, in_size, 0);
-				delete[] data;
-				logg->print(Log::INFO, client_id, "Image processing finished.");
+				sem_wait(&sem->svsem);
+				if (!sem->proc)
+					break;
+				sem_post(&sem->svsem);
+				sleep(1);
+			}
+
+			logg->print(Log::INFO, client_id, "Image processing finished.");
+			file = fs::path(name);
+			if (!fs::is_regular_file(file))
+			{
+				logg->print(Log::WARNING, client_id, "Image server processing error.");
+				file_size = 0;
+				sendWrapper(client_id, my_socket, &file_size, sizeof(file_size));
 			}
 			else
 			{
-				logg->print(Log::WARNING, client_id, "Image server processing error.");
-				in_size = 0;
-				send(my_socket, &in_size, sizeof(in_size), 0);
+				logg->print(Log::INFO, client_id, "Sending image result...");
+				file_size = fs::file_size(file);
+
+				file_descriptor = open(file.relative_path().c_str(), O_RDONLY);
+				if (file_descriptor < 0)
+					return logg->print(Log::ERROR, client_id, "open()", errno);
+
+				map_file = mmap(NULL, file_size, PROT_READ, MAP_SHARED, file_descriptor, 0);
+				if (map_file == MAP_FAILED)
+					return logg->print(Log::ERROR, client_id, "mmap()", errno);
+
+				sendWrapper(client_id, my_socket, &file_size, sizeof(file_size));
+				sendWrapper(client_id, my_socket, map_file, file_size);
+
+				munmap(map_file, file_size);
+				close(file_descriptor);
 			}
+
+			logmsg << "Sent " << file_size << "B to client.";
+			logg->print(Log::INFO, client_id, logmsg);
+
 			sem_post(&sem->svsem);
-			datsiz.clear();
+			sem_post(&sem->clsem);
+
+			logg->print(Log::INFO, client_id, (rm + imgdir).c_str());
+			system((rm + imgdir).c_str());
+
 			logg->print(Log::INFO, client_id, "Left image server.");
 		}
 
@@ -286,17 +332,8 @@ void clientInteractor(int my_socket, uint64_t client_id)
 		{
 			logg->print(Log::INFO, client_id, "Forwarding message to game server.");
 			qmsg = { client_id, true, 0 };
-			recv(my_socket, &qmsg.amount, sizeof(qmsg.amount), 0);
-
-			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
-			logg->commDebug("Client", client_id, logmsg);
-
+			recvWrapper(client_id, my_socket, &qmsg.amount, sizeof(qmsg.amount));
 			msgsnd(qid[0], &qmsg, sizeof(qmsg), 0);
-
-			logmsg << sizeof(qmsg.mtype) << ':' << (uint64_t)qmsg.mtype << ' ';
-			logmsg << sizeof(qmsg.turn) << ':' << (uint64_t)qmsg.turn << ' ';
-			logmsg << sizeof(qmsg.amount) << ':' << (uint64_t)qmsg.amount;
-			logg->commDebug(client_id, "GameServer", logmsg);
 		}
 	}
 }
@@ -304,6 +341,7 @@ void clientInteractor(int my_socket, uint64_t client_id)
 
 void imageServer()
 {
+	std::string clidir;
 	logg->print(Log::INFO, "ImageServer", "ImageServer running.");
 	while (true)
 	{
@@ -311,8 +349,14 @@ void imageServer()
 		if (sem->proc)
 		{
 			logg->print(Log::INFO, "ImageServer", "Processing request...");
+			clidir = std::string("./images/") + std::to_string(sem->clint);
+			logg->print(Log::INFO, sem->clint, (std::string("cd ") + clidir).c_str());
+			chdir(clidir.c_str());
+			logg->print(Log::INFO, sem->clint, sem->comm);
 			system(sem->comm);
 			sem->proc = false;
+			logg->print(Log::INFO, sem->clint, "cd ../..");
+			chdir("../..");
 			logg->print(Log::INFO, "ImageServer", "Processing finished.");
 		}
 		sem_post(&sem->svsem);
@@ -360,7 +404,7 @@ void gameServer()
 			}
 			catch (const GameSession::Errors exc)
 			{
-				logmsg << cmsg.mtype << " illegal turn rejected.";
+				logmsg << cmsg.mtype << "\'s illegal turn rejected.";
 				logg->print(Log::INFO, "GameServer", logmsg);
 
 				cmsg = { cmsg.mtype, true, session->left };
@@ -456,4 +500,34 @@ void GameSession::subtract(const uint8_t _amount)
 
 	left -= _amount;
 	player = !player;
+}
+
+
+void sendWrapper(const uint64_t _who, const int _sockfd, const void *_ptr,
+				 const uint64_t _len)
+{
+	if (send(_sockfd, _ptr, _len, 0) < 0)
+	{
+		if (errno == ECONNRESET)
+			logg->print(Log::INFO, _who, "Client disconnected on send().");
+		else
+			logg->print(Log::ERROR, _who, "send()", errno);
+		throw 0;
+	}
+}
+
+
+bool recvWrapper(const uint64_t _who, const int _sockfd, void *_ptr,
+				 const uint64_t _len, bool _wait)
+{
+	int err = recv(_sockfd, _ptr, _len, MSG_WAITALL | (MSG_DONTWAIT * !_wait));
+	if (err > 0)
+		return true;
+	if (!err)
+		logg->print(Log::INFO, _who, "Client disconnected on recv().");
+	else if (errno == EAGAIN)
+		return false;
+	else
+		logg->print(Log::ERROR, _who, "recv()", errno);
+	throw 0;
 }

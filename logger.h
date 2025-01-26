@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
@@ -20,9 +21,7 @@ public:
 	enum Type { INFO, WARNING, ERROR, FATAL } type;
 	std::string getType(const Type) const;
 	void print(Type, uint64_t, const char*, int = 0);
+	void print(Type, uint64_t, std::stringstream&, int = 0);
 	void print(Type, const char*, const char*, int = 0);
 	void print(Type, const char*, std::stringstream&, int = 0);
-	void commDebug(const char*, const char*, std::stringstream&);
-	void commDebug(uint64_t, const char*, std::stringstream&);
-	void commDebug(const char*, uint64_t, std::stringstream&);
 };
